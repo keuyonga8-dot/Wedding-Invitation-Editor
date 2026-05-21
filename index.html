@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<!-- HTML FILE: wedding_invitation_editor_V27_20260521.html -->
+<!-- HTML FILE: wedding_invitation_editor_V29_20260521.html -->
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>청첩장 에디터 V27</title>
+<title>청첩장 에디터 V29</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -519,7 +519,7 @@ input[type=file]{display:none}
   <div class="sec">
     <h2>저장</h2>
     <div class="row"><span class="lbl">저장 면</span><select id="saveSide"><option value="current">현재 보는 면</option><option value="front">앞면</option><option value="back">뒷면</option><option value="both">앞+뒤 모두</option></select></div>
-    <div class="row"><span class="lbl">저장 배율</span><select id="saveScale"><option value="2">일반 2배</option><option value="3">고화질 3배</option><option value="4" selected>인쇄용 4배 (~300dpi)</option><option value="5">최고화질 5배</option></select></div>
+    <div class="row"><span class="lbl">저장 배율</span><select id="saveScale"><option value="2:150">2배 · 150 DPI</option><option value="3:225">3배 · 225 DPI</option><option value="4:300" selected>4배 · 300 DPI (인쇄용)</option><option value="6:450">6배 · 450 DPI</option></select></div>
     <div class="g2" style="margin-top:8px">
       <button class="btn btnGhost" id="resetBtn">초기화</button>
       <button class="btn btnPrimary" id="saveBtn">PNG 저장</button>
@@ -1043,7 +1043,8 @@ async function captureWrap(side){
     return null;
   }
 
-  const sc=Number($('#saveScale').value)||4;
+  const scaleVal=$('#saveScale').value||'4:300';
+  const sc=Number(scaleVal.split(':')[0])||4;
 
   let cv;
   try{
@@ -1087,41 +1088,95 @@ function getFileName(){
   return{nm,ds};
 }
 
-/* ── PNG 저장 (단면 or 앞+뒤) ── */
+/* ── PNG에 dpi(pHYs 청크) 삽입 ──
+   PNG 스펙: pHYs 청크는 픽셀당 단위 수 (단위=meter)
+   300 DPI = 300/0.0254 ≈ 11811 pixels/meter
+   배율별 실제 DPI: 2x=192, 3x=288, 4x=384, 5x=480
+   → 배율에 맞는 dpi를 자동 계산해서 심음 */
+function injectDpi(dataUrl, dpi){
+  return new Promise(resolve=>{
+    /* dataUrl → ArrayBuffer */
+    const b64=dataUrl.split(',')[1];
+    const bin=atob(b64);
+    const src=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++)src[i]=bin.charCodeAt(i);
+
+    /* pHYs 청크 생성 (13바이트 데이터) */
+    const ppm=Math.round(dpi/0.0254); /* pixels per meter */
+    const phys=new Uint8Array(21); /* 4(len)+4(type)+9(data)+4(crc) */
+    const view=new DataView(phys.buffer);
+    view.setUint32(0,9); /* chunk data length = 9 */
+    phys[4]=0x70;phys[5]=0x48;phys[6]=0x59;phys[7]=0x73; /* "pHYs" */
+    view.setUint32(8,ppm);  /* X pixels per unit */
+    view.setUint32(12,ppm); /* Y pixels per unit */
+    phys[16]=1; /* unit = meter */
+    /* CRC32 over type+data (bytes 4..16) */
+    const crc=crc32(phys,4,17);
+    view.setInt32(17,crc);
+
+    /* PNG 구조: [sig 8B][IHDR chunk][pHYs 삽입][나머지] */
+    /* IHDR는 항상 sig(8) + len(4) + type(4) + data(13) + crc(4) = sig 다음 25바이트 */
+    const sig=8,ihdrEnd=sig+4+4+13+4; /* =33 */
+    const out=new Uint8Array(src.length+phys.length);
+    out.set(src.subarray(0,ihdrEnd),0);        /* sig + IHDR */
+    out.set(phys,ihdrEnd);                      /* pHYs */
+    out.set(src.subarray(ihdrEnd),ihdrEnd+phys.length); /* 나머지 */
+
+    resolve(new Blob([out],{type:'image/png'}));
+  });
+}
+
+/* CRC32 계산 (PNG pHYs용) */
+function crc32(buf,start,end){
+  let c=0xFFFFFFFF;
+  const table=crc32.t||(crc32.t=(()=>{
+    const t=new Uint32Array(256);
+    for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[i]=c}
+    return t;
+  })());
+  for(let i=start;i<end;i++)c=table[(c^buf[i])&0xFF]^(c>>>8);
+  return (c^0xFFFFFFFF)|0;
+}
+
+/* ── PNG 저장 ── */
 async function saveVisible(pref){
   if(!window.html2canvas){alert('저장 라이브러리를 불러오지 못했습니다.');return}
   const{nm,ds}=getFileName();
+  const scaleVal=$('#saveScale').value||'4:300';
+  const [scStr,dpiStr]=scaleVal.split(':');
+  const sc=Number(scStr)||4;
+  /* DPI: 선택지에 명시된 값 사용 */
+  const dpi=Number(dpiStr)||300;
+
+  async function doSave(cv, filename){
+    if(!cv)return;
+    const dataUrl=cv.toDataURL('image/png');
+    const blob=await injectDpi(dataUrl,dpi);
+    const a=document.createElement('a');
+    const u=URL.createObjectURL(blob);
+    a.download=filename;a.href=u;
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(u),500);
+  }
+
   if(pref==='both'){
-    /* 앞면, 뒷면 각각 PNG */
     try{
       for(const side of['front','back']){
         const cv=await captureWrap(side);
         if(!cv){alert('캡처 실패: '+side);continue;}
-        await new Promise(res=>{
-          cv.toBlob(blob=>{
-            if(!blob){alert('PNG 저장 실패');res();return}
-            const a=document.createElement('a');const u=URL.createObjectURL(blob);
-            a.download=nm+'_청첩장_'+side==='front'?'앞면':'뒷면'+'_'+ds+'.png';
-            a.download=nm+'_청첩장_'+(side==='front'?'앞면':'뒷면')+'_'+ds+'.png';
-            a.href=u;document.body.appendChild(a);a.click();a.remove();
-            setTimeout(()=>{URL.revokeObjectURL(u);res()},400);
-          },'image/png');
-        });
+        const label=side==='front'?'앞면':'뒷면';
+        await doSave(cv, nm+'_청첩장_'+label+'_'+ds+'.png');
         await new Promise(r=>setTimeout(r,300));
       }
     }catch(err){alert('저장 실패: '+err.message);console.error(err);}
     return;
   }
+
   const tgt=pref==='current'?currentSide:pref;
   try{
     const cv=await captureWrap(tgt);
     if(!cv)return;
-    cv.toBlob(blob=>{
-      if(!blob){alert('PNG 저장 실패');return}
-      const a=document.createElement('a');const u=URL.createObjectURL(blob);
-      a.download=nm+'_청첩장_'+ds+'.png';a.href=u;document.body.appendChild(a);a.click();a.remove();
-      setTimeout(()=>URL.revokeObjectURL(u),500);
-    },'image/png');
+    await doSave(cv, nm+'_청첩장_'+ds+'.png');
   }catch(err){alert('저장 실패: '+err.message);console.error(err);}
 }
 
